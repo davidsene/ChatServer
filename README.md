@@ -17,4 +17,4 @@ It was implemented as part of a course on modern concurrent programming techniqu
 
 - Pull this repo
 - `docker build -t chatserver .`
-- `docker run --rm -p 1234:1234 chatserver .`
+- `docker run --rm -p 1234:1234 chatserver`
