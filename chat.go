@@ -249,11 +249,11 @@ func handleNewConnection(conn net.Conn, msgChannel *MessageChannel) {
 
 
 func main() {
-	listener, err := net.Listen("tcp", "localhost:1234")
+	listener, err := net.Listen("tcp", ":1234")
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	log.Println("Chat server is up")
 	mainMsgChannel := NewMessageChannel()
 	mainMsgChannel.Open()
 
