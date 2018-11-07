@@ -61,9 +61,7 @@ func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
 		for {
 			msg, err := reader.ReadString('\n')
 			if err != nil {
-				if strings.Contains(err.Error(), "wsarecv") {
-					chatMember.quitPort <- struct{}{}
-				}
+				chatMember.quitPort <- struct{}{}
 				return
 			}
 			chatMember.connexionPort <- strings.Trim(msg," \n")
