@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-
 /*********************************************************** class ChatMember *****************************************************************/
 
 type ChatMember struct {
@@ -64,7 +63,7 @@ func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
 				chatMember.quitPort <- struct{}{}
 				return
 			}
-			chatMember.connexionPort <- strings.Trim(msg," \n")
+			chatMember.connexionPort <- strings.Trim(msg, " \n")
 		}
 	}()
 
@@ -102,8 +101,6 @@ func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
 func (chatMember *ChatMember) hasPseudo(pseudo string) bool {
 	return strings.Compare(chatMember.pseudo, pseudo) == 0
 }
-
-
 
 /*********************************************************** class MessageChannel *****************************************************************/
 
@@ -150,11 +147,11 @@ func (msgChannel *MessageChannel) Open() {
 				{
 					msgChannel.broadcastMessage(msg)
 				}
-			case member:= <-msgChannel.subscribePort:
+			case member := <-msgChannel.subscribePort:
 				{
 					msgChannel.addMember(member)
 				}
-			case member:= <-msgChannel.unSubscribePort:
+			case member := <-msgChannel.unSubscribePort:
 				{
 					msgChannel.removeMember(member)
 				}
@@ -181,7 +178,7 @@ func (msgChannel *MessageChannel) removeMember(unSubscribingMember UnSubscribing
 		msgChannel.broadcastMessage(Message{sender: "", content: chatMember.pseudo + " is gone", ignore: chatMember.pseudo})
 		log.Println(chatMember.pseudo + " logged out.")
 	}
-	msgChannel.members = Filter(msgChannel.members, func(member *ChatMember) bool { return ! member.hasPseudo(chatMember.pseudo) })
+	msgChannel.members = Filter(msgChannel.members, func(member *ChatMember) bool { return !member.hasPseudo(chatMember.pseudo) })
 }
 
 func Filter(ss []*ChatMember, test func(*ChatMember) bool) (ret []*ChatMember) {
@@ -200,7 +197,6 @@ func (msgChannel *MessageChannel) broadcastMessage(msg Message) {
 		}
 	}()
 }
-
 
 /********************************************************** class  Message ***********************************************************************/
 
@@ -222,15 +218,12 @@ func (msg *Message) Concerns(chatMember *ChatMember) bool {
 	return len(msg.sender) == 0 && !chatMember.hasPseudo(msg.ignore) || len(msg.sender) > 0 && !chatMember.hasPseudo(msg.sender)
 }
 
-
 /********************************************************** class  Message ***********************************************************************/
 
 type UnSubscribingChatMember struct {
 	chatMember       *ChatMember
 	deliberatelyGone bool
 }
-
-
 
 func handleNewConnection(conn net.Conn, msgChannel *MessageChannel) {
 	fmt.Fprintf(conn, "Nickname? ")
@@ -242,9 +235,8 @@ func handleNewConnection(conn net.Conn, msgChannel *MessageChannel) {
 	}
 	chatMember := NewChatMember(strings.Trim(pseudo, " \n"), conn)
 	chatMember.JoinChannel(msgChannel)
-	chatMember.StartListeningMessages(30)
+	chatMember.StartListeningMessages(600)
 }
-
 
 func main() {
 	listener, err := net.Listen("tcp", ":1234")
