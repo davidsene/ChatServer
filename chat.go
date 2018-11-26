@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -15,45 +17,75 @@ type ChatMember struct {
 	msgChannel     *MessageChannel
 	pseudo         string
 	msgChannelPort chan Message
-	connexionPort  chan string
+	inputsPort     chan string
 	quitPort       chan struct{}
 	conn           net.Conn
+	server         *Server
 }
 
-func NewChatMember(pseudo string, conn net.Conn) *ChatMember {
+func NewChatMember(pseudo string, conn net.Conn, server *Server, idleness int) *ChatMember {
 	chatMember := &ChatMember{
 		pseudo:         pseudo,
-		msgChannelPort: make(chan Message, 1),
-		connexionPort:  make(chan string),
+		msgChannelPort: make(chan Message, 5),
+		inputsPort:     make(chan string),
 		quitPort:       make(chan struct{}),
 		conn:           conn,
+		server:         server,
 	}
-	fmt.Fprintf(chatMember.conn, "Welcome on board %s\n", chatMember.pseudo)
+	server.AddMember(chatMember)
+	chatMember.startListening(idleness)
 	return chatMember
 }
 
 func (chatMember *ChatMember) JoinChannel(msgChannel *MessageChannel) {
 	chatMember.msgChannel = msgChannel
-	msgChannel.Subscribe(chatMember)
+	msgChannel.SubscribeAsync(chatMember)
 }
 
-func (chatMember *ChatMember) QuitChannel(deliberatelyGone bool) {
-	if !deliberatelyGone {
-		fmt.Fprintf(chatMember.conn, "Idle for a long time. I disconnect you")
+func (chatMember *ChatMember) QuitChannel(reason UnSubscribReason) {
+	chatMember.msgChannel.UnSubscribeAsync(chatMember, reason)
+	chatMember.msgChannel = nil
+}
+
+func (chatMember *ChatMember) ChangeChannel(channel *MessageChannel) {
+	if chatMember.IsConnectedToAChannel() {
+		chatMember.QuitChannel(QUIT_CHANNEL)
 	}
-	chatMember.conn.Close()
-	chatMember.msgChannel.UnSubscribe(chatMember, deliberatelyGone)
+	chatMember.JoinChannel(channel)
 }
 
 func (chatMember *ChatMember) PublishMessage(content string) {
-	chatMember.msgChannel.PublishMessage(Message{sender: chatMember.pseudo, content: content})
+	chatMember.msgChannel.PublishMessageAsync(Message{sender: chatMember.pseudo, content: content})
 }
 
 func (chatMember *ChatMember) ReceiveMessage(msg Message) {
 	chatMember.msgChannelPort <- msg
 }
 
-func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
+func (chatMember *ChatMember) ReceiveNotification(notification string) {
+	chatMember.msgChannelPort <- Message{content: notification, sender: ""}
+}
+
+func (chatMember *ChatMember) IsConnectedToAChannel() bool {
+	return chatMember.msgChannel != nil
+}
+
+//Private methods
+
+func (chatMember *ChatMember) quitServer(deliberatelyGone bool) {
+	if chatMember.IsConnectedToAChannel() {
+		if deliberatelyGone {
+			chatMember.QuitChannel(LOGOUT)
+		} else {
+			chatMember.ReceiveNotification("Idle for a long time. I disconnect you")
+			chatMember.QuitChannel(IDLE)
+		}
+	}
+	chatMember.conn.Close() // TODO Attention
+	chatMember.server.RemoveMember(chatMember)
+}
+
+func (chatMember *ChatMember) startListening(idlenessTimeout int) {
 
 	go func() {
 		reader := bufio.NewReader(chatMember.conn)
@@ -63,7 +95,7 @@ func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
 				chatMember.quitPort <- struct{}{}
 				return
 			}
-			chatMember.connexionPort <- strings.Trim(msg, " \n")
+			chatMember.inputsPort <- strings.Trim(msg, " \n")
 		}
 	}()
 
@@ -71,31 +103,51 @@ func (chatMember *ChatMember) StartListeningMessages(idlenessTimeout int) {
 		timeout := time.After(time.Duration(idlenessTimeout) * time.Second)
 		for {
 			select {
-			case content := <-chatMember.connexionPort:
+			case input := <-chatMember.inputsPort:
 				{
 					timeout = time.After(time.Duration(idlenessTimeout) * time.Second)
-					chatMember.PublishMessage(content)
+					chatMember.processInput(input)
 				}
 			case msg := <-chatMember.msgChannelPort:
 				{
-					if msg.Concerns(chatMember) {
-						fmt.Fprintf(chatMember.conn, msg.String())
-					}
+					fmt.Fprintf(chatMember.conn, msg.String())
 				}
 			case <-timeout:
 				{
-					chatMember.QuitChannel(false)
+					chatMember.quitServer(false)
 					return
 				}
 			case <-chatMember.quitPort:
 				{
-					chatMember.QuitChannel(true)
+					chatMember.quitServer(true)
 					return
 				}
 			}
 		}
 	}()
+}
 
+func (chatMember *ChatMember) processInput(input string) {
+
+	if strings.HasPrefix(input, "/") {
+		inputs := regexp.MustCompile("(\\s)+").Split(input, -1)
+		cmd := strings.TrimPrefix(inputs[0], "/")
+		var args []string
+		if len(inputs) > 1 {
+			args = inputs[1:]
+		}
+		_, resp := chatMember.server.cmdProcessor.processCommand(cmd, args, chatMember)
+		chatMember.ReceiveMessage(Message{content: resp, sender: ""})
+
+	} else {
+		if chatMember.IsConnectedToAChannel() {
+			chatMember.PublishMessage(input)
+		} else {
+			msg := "[INFO] You cannot write a message until you are connected to a channel \n"
+			msg += "[INFO] Try /help command to see available commands :)"
+			chatMember.ReceiveMessage(Message{content: msg, sender: ""})
+		}
+	}
 }
 
 func (chatMember *ChatMember) hasPseudo(pseudo string) bool {
@@ -109,37 +161,53 @@ type MessageChannel struct {
 	subscribePort   chan *ChatMember
 	unSubscribePort chan UnSubscribingChatMember
 	messagePort     chan Message
+	name            string
+	secret          string
 }
 
-func NewMessageChannel() *MessageChannel {
+func NewPrivateMessageChannel(name string) *MessageChannel {
+	msgChannel := NewMessageChannel(name)
+	msgChannel.secret = RandomString(10)
+	return msgChannel
+}
+
+func NewMessageChannel(name string) *MessageChannel {
 	msgChannel := &MessageChannel{
 		members:         []*ChatMember{},
 		subscribePort:   make(chan *ChatMember),
 		unSubscribePort: make(chan UnSubscribingChatMember),
 		messagePort:     make(chan Message),
+		name:            name,
+		secret:          "",
 	}
+	msgChannel.open()
 	return msgChannel
 }
 
-func (msgChannel *MessageChannel) Subscribe(chatMember *ChatMember) {
+func (msgChannel *MessageChannel) IsPrivate() bool {
+	return strings.Compare(msgChannel.secret, "") != 0
+}
+
+func (msgChannel *MessageChannel) SubscribeAsync(chatMember *ChatMember) {
 	go func() {
 		msgChannel.subscribePort <- chatMember
 	}()
 }
 
-func (msgChannel *MessageChannel) UnSubscribe(chatMember *ChatMember, deliberatelyGone bool) {
+func (msgChannel *MessageChannel) UnSubscribeAsync(chatMember *ChatMember, reason UnSubscribReason) {
 	go func() {
-		chatMember.msgChannel.unSubscribePort <- UnSubscribingChatMember{chatMember: chatMember, deliberatelyGone: deliberatelyGone}
+		msgChannel.unSubscribePort <- UnSubscribingChatMember{chatMember: chatMember, reason: reason}
 	}()
 }
 
-func (msgChannel *MessageChannel) PublishMessage(message Message) {
+func (msgChannel *MessageChannel) PublishMessageAsync(message Message) {
 	go func() {
 		msgChannel.messagePort <- message
 	}()
 }
 
-func (msgChannel *MessageChannel) Open() {
+//Methods privées
+func (msgChannel *MessageChannel) open() {
 	go func() {
 		for {
 			select {
@@ -160,27 +228,41 @@ func (msgChannel *MessageChannel) Open() {
 	}()
 }
 
-//Method privées
-
 func (msgChannel *MessageChannel) addMember(chatMember *ChatMember) {
+	msgChannel.broadcastInfo(chatMember.pseudo + " joined the channel")
 	msgChannel.members = append(msgChannel.members, chatMember)
-	msgChannel.broadcastMessage(Message{sender: "", content: chatMember.pseudo + " joined the channel", ignore: chatMember.pseudo})
-	log.Println("Login of " + chatMember.pseudo)
+	log.Println(chatMember.pseudo + " joined the channel [" + msgChannel.name + "]")
+	chatMember.ReceiveNotification("Welcome on the channel [" + msgChannel.name + "]")
 }
 
 func (msgChannel *MessageChannel) removeMember(unSubscribingMember UnSubscribingChatMember) {
-	deliberatelyGone := unSubscribingMember.deliberatelyGone
-	chatMember := unSubscribingMember.chatMember
-	if !deliberatelyGone {
-		msgChannel.broadcastMessage(Message{sender: "", content: chatMember.pseudo + " was idle too long and was disconnected", ignore: chatMember.pseudo})
-		log.Println(chatMember.pseudo + " seems to be out. Force disconnection.")
-	} else {
-		msgChannel.broadcastMessage(Message{sender: "", content: chatMember.pseudo + " is gone", ignore: chatMember.pseudo})
-		log.Println(chatMember.pseudo + " logged out.")
+	member := unSubscribingMember.chatMember
+	msgChannel.members = Filter(msgChannel.members, func(m *ChatMember) bool { return !m.hasPseudo(member.pseudo) })
+
+	if unSubscribingMember.reason == IDLE {
+		msgChannel.broadcastInfo(member.pseudo + " was idle too long and was disconnected")
+		log.Println(member.pseudo + " seems to be out. Force disconnection.")
+	} else if unSubscribingMember.reason == LOGOUT {
+		msgChannel.broadcastInfo(member.pseudo + " has logged out.")
+	} else if unSubscribingMember.reason == QUIT_CHANNEL {
+		msgChannel.broadcastInfo(member.pseudo + " has changed channel.")
+		member.ReceiveNotification("You have been retired from channel [" + msgChannel.name + "]")
 	}
-	msgChannel.members = Filter(msgChannel.members, func(member *ChatMember) bool { return !member.hasPseudo(chatMember.pseudo) })
+	log.Println(member.pseudo + "has been retired from channel [" + msgChannel.name + "]")
+
 }
 
+func (msgChannel *MessageChannel) broadcastMessage(msg Message) {
+	for _, member := range msgChannel.members {
+		member.ReceiveMessage(msg)
+	}
+}
+
+func (msgChannel *MessageChannel) broadcastInfo(info string) {
+	msgChannel.broadcastMessage(Message{sender: "", content: info})
+}
+
+//utils
 func Filter(ss []*ChatMember, test func(*ChatMember) bool) (ret []*ChatMember) {
 	for _, s := range ss {
 		if test(s) {
@@ -190,12 +272,12 @@ func Filter(ss []*ChatMember, test func(*ChatMember) bool) (ret []*ChatMember) {
 	return
 }
 
-func (msgChannel *MessageChannel) broadcastMessage(msg Message) {
-	go func() {
-		for _, member := range msgChannel.members {
-			member.ReceiveMessage(msg)
-		}
-	}()
+func RandomString(len int) string {
+	bytes := make([]byte, len)
+	for i := 0; i < len; i++ {
+		bytes[i] = byte(65 + rand.Intn(25)) //A=65 and Z = 65+25
+	}
+	return string(bytes)
 }
 
 /********************************************************** class  Message ***********************************************************************/
@@ -203,7 +285,6 @@ func (msgChannel *MessageChannel) broadcastMessage(msg Message) {
 type Message struct {
 	sender  string
 	content string
-	ignore  string
 }
 
 func (msg *Message) String() string {
@@ -214,18 +295,247 @@ func (msg *Message) String() string {
 	}
 }
 
-func (msg *Message) Concerns(chatMember *ChatMember) bool {
-	return len(msg.sender) == 0 && !chatMember.hasPseudo(msg.ignore) || len(msg.sender) > 0 && !chatMember.hasPseudo(msg.sender)
-}
-
 /********************************************************** class  Message ***********************************************************************/
 
+type UnSubscribReason int
+
+const (
+	IDLE UnSubscribReason = 1 + iota
+	LOGOUT
+	QUIT_CHANNEL
+)
+
 type UnSubscribingChatMember struct {
-	chatMember       *ChatMember
-	deliberatelyGone bool
+	chatMember *ChatMember
+	reason     UnSubscribReason
 }
 
-func handleNewConnection(conn net.Conn, msgChannel *MessageChannel) {
+/***************************************************** Commande Processor ***********************************************************************/
+
+type CommandProcessor struct {
+	commands []*Command
+}
+
+func newCommandProcessor() *CommandProcessor {
+	processor := &CommandProcessor{
+		commands: []*Command{},
+	}
+	return processor
+}
+
+func (processor *CommandProcessor) addCommand(command *Command) {
+	processor.commands = append(processor.commands, command)
+}
+
+func (processor *CommandProcessor) processCommand(cmd string, args []string, member *ChatMember) (bool, string) {
+	for _, v := range processor.commands {
+		if 0 == strings.Compare((*v).name(), cmd) {
+			return (*v).exec(args, member)
+		}
+	}
+	return false, "unknown command"
+
+}
+
+type Command interface {
+	exec([]string, *ChatMember) (bool, string)
+	name() string
+	description() string
+}
+
+/**********************************join_channel command ***************************/
+
+type JoinChannel struct{}
+
+func (joinChannel *JoinChannel) exec(args []string, member *ChatMember) (bool, string) {
+	if len(args) < 1 {
+		return false, "incorrect number of arguments."
+	}
+	channelName := args[0]
+	channel := member.server.FindChannel(channelName)
+	if channel == nil {
+		return false, "Channel [" + channelName + "] does'nt exist."
+	}
+
+	if member.IsConnectedToAChannel() && strings.Compare(channel.name, member.msgChannel.name) == 0 {
+		return false, "You have already joined the channel [" + channel.name + "]"
+	}
+
+	if channel.IsPrivate() {
+		if len(args) < 2 {
+			return false, "This channel is private. Please submit the additional secret to join it."
+		}
+		secret := args[1]
+		if strings.Compare(secret, channel.secret) != 0 {
+			return false, "The submitted secret is incorrect."
+		}
+	}
+	member.ChangeChannel(channel)
+	return true, "Joining channel " + channelName + "..."
+}
+
+func (joinChannel *JoinChannel) name() string {
+	return "join"
+}
+
+func (joinChannel *JoinChannel) description() string {
+	return "Join a channel : /join 'channel_name'"
+}
+
+func newJoinChannel() *JoinChannel {
+	return &JoinChannel{}
+}
+
+/********************************** quit_channel command ***************************/
+
+type QuitChannel struct{}
+
+func (quiteChannel *QuitChannel) exec(args []string, member *ChatMember) (bool, string) {
+
+	if !member.IsConnectedToAChannel() {
+		return false, "You are not connected to any channel."
+	}
+	msg := "Quiting channel  " + member.msgChannel.name + "..."
+	member.QuitChannel(QUIT_CHANNEL)
+	return true, msg
+}
+
+func (quiteChannel *QuitChannel) name() string {
+	return "quit"
+}
+
+func (quiteChannel *QuitChannel) description() string {
+	return "Quit a channel : /quit 'channel_name'"
+}
+
+func newQuitChannel() *QuitChannel {
+	return &QuitChannel{}
+}
+
+/********************************** help command ***************************/
+
+type HelpCMD struct{}
+
+func (helpCMD *HelpCMD) exec(args []string, member *ChatMember) (bool, string) {
+	res := ""
+	for _, cmd := range member.server.cmdProcessor.commands {
+		res = res + (*cmd).name() + " -> " + (*cmd).description() + "\n"
+	}
+	res = strings.TrimSuffix(res, "\n")
+	return true, res
+}
+
+func (helpCMD *HelpCMD) name() string {
+	return "help"
+}
+
+func (helpCMD *HelpCMD) description() string {
+	return "Display available commands : /help"
+}
+
+func newHelpCMD() *HelpCMD {
+	return &HelpCMD{}
+}
+
+/**********************************create_channel command ***************************/
+
+type CreateChannel struct{}
+
+func (createChannel *CreateChannel) exec(args []string, member *ChatMember) (bool, string) {
+	if len(args) < 1 {
+		return false, "Please give the name of the channel."
+	}
+	channelName := args[0]
+	channel := member.server.FindChannel(channelName)
+	if channel != nil {
+		return false, "This channel name is already used."
+	}
+
+	if len(args) > 1 {
+		option := args[1]
+		if strings.Compare(option, "--private") == 0 {
+			channel = NewPrivateMessageChannel(channelName)
+		} else {
+			return false, "Only the --private option is accepted in addition to create a private channel."
+		}
+	} else {
+		channel = NewMessageChannel(channelName)
+	}
+	member.server.AddChannel(channel)
+	var res string
+	if channel.IsPrivate() {
+		res = "Channel [" + channel.name + "] has been created with secret [" + channel.secret + "]."
+	} else {
+		res = "Channel [" + channel.name + "] has been created."
+	}
+	return true, res
+
+}
+
+func (createChannel *CreateChannel) name() string {
+	return "create"
+}
+
+func (createChannel *CreateChannel) description() string {
+	return "Create a channel : /create 'channel_name'"
+}
+
+func newCreateChannel() *CreateChannel {
+	return &CreateChannel{}
+}
+
+/***************************************************** Server ***********************************************************************/
+
+type Server struct {
+	channels     []*MessageChannel
+	chatMembers  []*ChatMember
+	cmdProcessor *CommandProcessor
+}
+
+func newServer() *Server {
+	return &Server{
+		channels:     []*MessageChannel{},
+		chatMembers:  []*ChatMember{},
+		cmdProcessor: newCommandProcessor(),
+	}
+}
+
+func (server *Server) AddMember(member *ChatMember) {
+	server.chatMembers = append(server.chatMembers, member)
+	member.ReceiveNotification("Welcome on board " + member.pseudo)
+	log.Println(member.pseudo + " Logged in.")
+}
+
+func (server *Server) RemoveMember(member *ChatMember) {
+	server.chatMembers = Filter(server.chatMembers, func(member *ChatMember) bool { return !member.hasPseudo(member.pseudo) })
+	log.Println(member.pseudo + " Logged out.")
+}
+
+func (server *Server) AddChannel(channel *MessageChannel) {
+	if channel.IsPrivate() {
+		log.Println("New private channel " + channel.name + " created with secret [" + channel.secret + "]")
+	} else {
+		log.Println("New public channel " + channel.name + " created")
+	}
+	server.channels = append(server.channels, channel)
+}
+
+func (server *Server) FindChannel(name string) *MessageChannel {
+	for _, channel := range server.channels {
+		if strings.Compare(channel.name, name) == 0 {
+			return channel
+		}
+	}
+	return nil
+}
+
+func (server *Server) AddCommand(command Command) {
+	server.cmdProcessor.addCommand(&command)
+}
+
+/***************************************************** Main ***********************************************************************/
+
+func handleNewConnection(conn net.Conn, server *Server) {
 	fmt.Fprintf(conn, "Nickname? ")
 	reader := bufio.NewReader(conn)
 	pseudo, err := reader.ReadString('\n')
@@ -233,9 +543,8 @@ func handleNewConnection(conn net.Conn, msgChannel *MessageChannel) {
 		log.Println(err)
 		return
 	}
-	chatMember := NewChatMember(strings.Trim(pseudo, " \n"), conn)
-	chatMember.JoinChannel(msgChannel)
-	chatMember.StartListeningMessages(600)
+	member := NewChatMember(strings.Trim(pseudo, " \n"), conn, server, 600)
+	member.JoinChannel(server.FindChannel("general"))
 }
 
 func main() {
@@ -244,8 +553,17 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("Chat server is up")
-	mainMsgChannel := NewMessageChannel()
-	mainMsgChannel.Open()
+
+	server := newServer()
+	server.AddCommand(newJoinChannel())
+	server.AddCommand(newQuitChannel())
+	server.AddCommand(newHelpCMD())
+	server.AddCommand(newCreateChannel())
+
+	general := NewMessageChannel("general")
+	random := NewMessageChannel("random")
+	server.AddChannel(random)
+	server.AddChannel(general)
 
 	for {
 		conn, err := listener.Accept()
@@ -253,6 +571,6 @@ func main() {
 			log.Println(err)
 			continue
 		}
-		go handleNewConnection(conn, mainMsgChannel)
+		go handleNewConnection(conn, server)
 	}
 }
