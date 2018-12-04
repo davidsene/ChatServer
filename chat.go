@@ -42,7 +42,7 @@ func (chatMember *ChatMember) JoinChannel(msgChannel *MessageChannel) {
 	msgChannel.SubscribeAsync(chatMember)
 }
 
-func (chatMember *ChatMember) QuitChannel(reason UnSubscribReason) {
+func (chatMember *ChatMember) QuitChannel(reason UnSubscribesReason) {
 	chatMember.msgChannel.UnSubscribeAsync(chatMember, reason)
 	chatMember.msgChannel = nil
 }
@@ -70,6 +70,10 @@ func (chatMember *ChatMember) IsConnectedToAChannel() bool {
 	return chatMember.msgChannel != nil
 }
 
+func (chatMember *ChatMember) HasPseudo(pseudo string) bool {
+	return strings.Compare(chatMember.pseudo, pseudo) == 0
+}
+
 //Private methods
 
 func (chatMember *ChatMember) quitServer(deliberatelyGone bool) {
@@ -81,7 +85,7 @@ func (chatMember *ChatMember) quitServer(deliberatelyGone bool) {
 			chatMember.QuitChannel(IDLE)
 		}
 	}
-	chatMember.conn.Close() // TODO Attention
+	chatMember.conn.Close()
 	chatMember.server.RemoveMember(chatMember)
 }
 
@@ -110,7 +114,9 @@ func (chatMember *ChatMember) startListening(idlenessTimeout int) {
 				}
 			case msg := <-chatMember.msgChannelPort:
 				{
-					fmt.Fprintf(chatMember.conn, msg.String())
+					if msg.concerns(chatMember) {
+						fmt.Fprintf(chatMember.conn, msg.String())
+					}
 				}
 			case <-timeout:
 				{
@@ -148,10 +154,6 @@ func (chatMember *ChatMember) processInput(input string) {
 			chatMember.ReceiveMessage(Message{content: msg, sender: ""})
 		}
 	}
-}
-
-func (chatMember *ChatMember) hasPseudo(pseudo string) bool {
-	return strings.Compare(chatMember.pseudo, pseudo) == 0
 }
 
 /*********************************************************** class MessageChannel *****************************************************************/
@@ -194,7 +196,7 @@ func (msgChannel *MessageChannel) SubscribeAsync(chatMember *ChatMember) {
 	}()
 }
 
-func (msgChannel *MessageChannel) UnSubscribeAsync(chatMember *ChatMember, reason UnSubscribReason) {
+func (msgChannel *MessageChannel) UnSubscribeAsync(chatMember *ChatMember, reason UnSubscribesReason) {
 	go func() {
 		msgChannel.unSubscribePort <- UnSubscribingChatMember{chatMember: chatMember, reason: reason}
 	}()
@@ -237,7 +239,7 @@ func (msgChannel *MessageChannel) addMember(chatMember *ChatMember) {
 
 func (msgChannel *MessageChannel) removeMember(unSubscribingMember UnSubscribingChatMember) {
 	member := unSubscribingMember.chatMember
-	msgChannel.members = Filter(msgChannel.members, func(m *ChatMember) bool { return !m.hasPseudo(member.pseudo) })
+	msgChannel.members = Filter(msgChannel.members, func(m *ChatMember) bool { return !m.HasPseudo(member.pseudo) })
 
 	if unSubscribingMember.reason == IDLE {
 		msgChannel.broadcastInfo(member.pseudo + " was idle too long and was disconnected")
@@ -294,23 +296,26 @@ func (msg *Message) String() string {
 		return msg.content + "\n"
 	}
 }
+func (msg *Message) concerns(member *ChatMember) bool {
+	return len(msg.sender) == 0 || !member.HasPseudo(msg.sender)
+}
 
 /********************************************************** class  Message ***********************************************************************/
 
-type UnSubscribReason int
+type UnSubscribesReason int
 
 const (
-	IDLE UnSubscribReason = 1 + iota
+	IDLE UnSubscribesReason = 1 + iota
 	LOGOUT
 	QUIT_CHANNEL
 )
 
 type UnSubscribingChatMember struct {
 	chatMember *ChatMember
-	reason     UnSubscribReason
+	reason     UnSubscribesReason
 }
 
-/***************************************************** Commande Processor ***********************************************************************/
+/***************************************************** Command Processor ***********************************************************************/
 
 type CommandProcessor struct {
 	commands []*Command
@@ -507,7 +512,7 @@ func (server *Server) AddMember(member *ChatMember) {
 }
 
 func (server *Server) RemoveMember(member *ChatMember) {
-	server.chatMembers = Filter(server.chatMembers, func(member *ChatMember) bool { return !member.hasPseudo(member.pseudo) })
+	server.chatMembers = Filter(server.chatMembers, func(member *ChatMember) bool { return !member.HasPseudo(member.pseudo) })
 	log.Println(member.pseudo + " Logged out.")
 }
 
